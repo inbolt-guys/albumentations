@@ -124,7 +124,7 @@ class KeypointsProcessor(DataProcessor):
     def check(self, data: Sequence[Sequence], rows: int, cols: int) -> None:
         check_keypoints(data, rows, cols)
 
-    def convert_from_albumentations(self, data: Sequence[Sequence], rows: int, cols: int) -> List[Tuple]:
+    def convert_from_albumentations(self, data: Sequence[Sequence], rows: int, cols: int, **kwargs) -> List[Tuple]:
         params = self.params
         return convert_keypoints_from_albumentations(
             data,
@@ -135,7 +135,7 @@ class KeypointsProcessor(DataProcessor):
             angle_in_degrees=params.angle_in_degrees,
         )
 
-    def convert_to_albumentations(self, data: Sequence[Sequence], rows: int, cols: int) -> List[Tuple]:
+    def convert_to_albumentations(self, data: Sequence[Sequence], rows: int, cols: int, **kwargs) -> List[Tuple]:
         params = self.params
         return convert_keypoints_to_albumentations(
             data,

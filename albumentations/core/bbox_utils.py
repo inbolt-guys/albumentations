@@ -117,11 +117,11 @@ class BboxProcessor(DataProcessor):
     def check(self, data: Sequence, rows: int, cols: int) -> None:
         check_bboxes(data)
 
-    def convert_from_albumentations(self, data: Sequence, rows: int, cols: int) -> List[BoxType]:
-        return convert_bboxes_from_albumentations(data, self.params.format, rows, cols, check_validity=True)
+    def convert_from_albumentations(self, data: Sequence, rows: int, cols: int, check_validity: bool = True) -> List[BoxType]:
+        return convert_bboxes_from_albumentations(data, self.params.format, rows, cols, check_validity=check_validity)
 
-    def convert_to_albumentations(self, data: Sequence[BoxType], rows: int, cols: int) -> List[BoxType]:
-        return convert_bboxes_to_albumentations(data, self.params.format, rows, cols, check_validity=True)
+    def convert_to_albumentations(self, data: Sequence[BoxType], rows: int, cols: int, check_validity:bool = True) -> List[BoxType]:
+        return convert_bboxes_to_albumentations(data, self.params.format, rows, cols, check_validity=check_validity)
 
 
 def normalize_bbox(bbox: TBox, rows: int, cols: int) -> TBox:

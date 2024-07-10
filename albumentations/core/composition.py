@@ -197,7 +197,6 @@ class Compose(BaseCompose):
         check_each_transform = any(
             getattr(item.params, "check_each_transform", False) for item in self.processors.values()
         )
-
         for p in self.processors.values():
             p.preprocess(data)
 
@@ -207,7 +206,6 @@ class Compose(BaseCompose):
             if check_each_transform:
                 data = self._check_data_post_transform(data)
         data = Compose._make_targets_contiguous(data)  # ensure output targets are contiguous
-
         for p in self.processors.values():
             p.postprocess(data)
 
