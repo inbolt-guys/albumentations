@@ -28,6 +28,8 @@ __all__ = [
     "CropAndPad",
     "RandomCropFromBorders",
     "BBoxSafeRandomCrop",
+    "CopyPaste",
+    "copy_paste_class"
 ]
 
 
@@ -560,7 +562,400 @@ class RandomSizedBBoxSafeCrop(BBoxSafeRandomCrop):
     def get_transform_init_args_names(self):
         return super().get_transform_init_args_names() + ("height", "width", "interpolation")
 
+import os
+import cv2
+import random
+import numpy as np
+import albumentations as A
+from copy import deepcopy
+from skimage.filters import gaussian
+from math import ceil, floor
+import copy
+from warnings import warn
 
+def image_copy_paste(img, paste_img, alpha, blend=True, sigma=1):
+    if alpha is not None:
+        if blend:
+            alpha = gaussian(alpha, sigma=sigma, preserve_range=True)
+
+        img_dtype = img.dtype
+        alpha = alpha[..., None]
+        img = paste_img * alpha + img * (1 - alpha)
+        img = img.astype(img_dtype)
+
+    return img
+
+def mask_copy_paste(mask, paste_mask, alpha):
+    raise NotImplementedError
+
+def masks_copy_paste(masks, paste_masks, alpha):
+    if alpha is not None:
+        #eliminate pixels that will be pasted over
+        masks = [
+            np.logical_and(mask, np.logical_xor(mask, alpha)).astype(np.uint8) for mask in masks
+        ]
+        masks.extend(paste_masks)
+
+    return masks
+
+
+def extract_bboxes(masks):
+    bboxes = []
+    for mask in masks:
+        h, w = mask.shape
+        yindices = np.where(np.any(mask, axis=0))[0]
+        xindices = np.where(np.any(mask, axis=1))[0]
+        if yindices.shape[0]:
+            y1, y2 = yindices[[0, -1]]
+            x1, x2 = xindices[[0, -1]]
+            y2 += 1
+            x2 += 1
+            y1 /= w
+            y2 /= w
+            x1 /= h
+            x2 /= h
+        else:
+            y1, x1, y2, x2 = 0, 0, 0, 0
+
+        bboxes.append((y1, x1, y2, x2))
+
+    return bboxes
+
+def bboxes_copy_paste(bboxes, paste_bboxes, masks, paste_masks, alpha, key):
+    if key == 'paste_bboxes':
+        return bboxes
+    elif paste_bboxes is not None:
+        
+        masks = masks_copy_paste(masks, paste_masks=[], alpha=alpha)
+        adjusted_bboxes = extract_bboxes(masks)
+
+        #only keep the bounding boxes for objects listed in bboxes
+        mask_indices = [box[-1] for box in bboxes]
+        adjusted_bboxes = [adjusted_bboxes[idx] for idx in mask_indices]
+        #append bbox tails (classes, etc.)
+        adjusted_bboxes = [bbox + tail[4:] for bbox, tail in zip(adjusted_bboxes, bboxes)]
+
+        #adjust paste_bboxes mask indices to avoid overlap
+        adjusted_paste_bboxes = extract_bboxes(paste_masks)
+        adjusted_paste_bboxes = [apbox + tail[4:] for apbox, tail in zip(adjusted_paste_bboxes, paste_bboxes)]
+
+        bboxes = adjusted_bboxes + adjusted_paste_bboxes
+
+
+    return bboxes
+
+def keypoints_copy_paste(keypoints, paste_keypoints, alpha):
+    #remove occluded keypoints
+    if alpha is not None:
+        visible_keypoints = []
+        for kp in keypoints:
+            x, y = kp[:2]
+            tail = kp[2:]
+            if alpha[int(y), int(x)] == 0:
+                visible_keypoints.append(kp)
+
+        keypoints = visible_keypoints + paste_keypoints
+
+    return keypoints
+
+def apply_scale_jittering(image, mask, bbox, scale_range=(0.5, 1.5)):
+    scale_factor = random.uniform(*scale_range)
+
+    scaled_mask = cv2.resize(mask, None, fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_NEAREST)
+    scaled_image = cv2.resize(image, None, fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_NEAREST)
+
+    sh, sw = scaled_image.shape[:2]
+
+    scaled_bbox = extract_bboxes([scaled_mask])[0]
+    scaled_bbox = (round(scaled_bbox[0]*sw), round(scaled_bbox[1]*sh), round(scaled_bbox[2]*sw), round(scaled_bbox[3]*sh), bbox[4], bbox[5])
+    return scaled_image, scaled_mask, scaled_bbox, scale_factor
+
+class CopyPaste(A.DualTransform):
+    def __init__(
+        self,
+        blend=True,
+        sigma=3,
+        pct_objects_paste=0.1,
+        max_paste_objects=None,
+        p=0.5,
+        always_apply=False,
+        scale_range=(0.5, 1.5)
+    ):
+        super(CopyPaste, self).__init__(always_apply, p)
+        self.blend = blend
+        self.sigma = sigma
+        self.pct_objects_paste = pct_objects_paste
+        self.max_paste_objects = max_paste_objects
+        self.p = p
+        self.always_apply = always_apply
+        self.scale_range = scale_range
+
+    @staticmethod
+    def get_class_fullname():
+        return 'copypaste.CopyPaste'
+
+    @property
+    def targets_as_params(self):
+        return [
+            "masks",
+            "paste_image",
+            #"paste_mask",
+            "paste_masks",
+            "paste_bboxes",
+            #"paste_keypoints"
+        ]
+    
+    def __call__(self, force_apply=False, **kwargs):
+        if self.replay_mode:
+            if self.applied_in_replay:
+                return self.apply_with_params(self.params, **kwargs)
+
+            return kwargs
+
+        if (random.random() < self.p) or self.always_apply or force_apply:
+            params = self.get_params()
+            if self.targets_as_params:
+                assert all(key in kwargs for key in self.targets_as_params), "{} requires {}".format(
+                    self.__class__.__name__, self.targets_as_params
+                )
+                targets_as_params = {k: kwargs[k] for k in self.targets_as_params}
+                params_dependent_on_targets = self.get_params_dependent_on_targets(kwargs)
+                params.update(params_dependent_on_targets)
+            if self.deterministic:
+                if self.targets_as_params:
+                    warn(
+                        self.get_class_fullname() + " could work incorrectly in ReplayMode for other input data"
+                        " because its' params depend on targets."
+                    )
+                kwargs[self.save_key][id(self)] = deepcopy(params)
+            return self.apply_with_params(params, **kwargs)
+
+        return kwargs
+
+    def get_params_dependent_on_targets(self, params):
+        h, w = params["image"].shape[:2]
+        nb_masks = len(params["masks"])
+        
+        paste_image = params["paste_image"]
+        masks = params["paste_masks"]
+        bboxes = params.get("paste_bboxes", None)
+        keypoints = params.get("paste_keypoints", None)
+
+        n_objects = len(bboxes) if bboxes is not None else len(masks)
+
+        n_select = n_objects
+        if self.pct_objects_paste:
+            n_select = ceil(n_select * self.pct_objects_paste)
+        if self.max_paste_objects:
+            n_select = min(n_select, self.max_paste_objects)
+
+        if n_select == 0:
+            return {
+                "param_masks": params["masks"],
+                "paste_imgs": [],
+                "alphas": [],
+                "paste_masks": [],
+                "paste_bboxes": [],
+                "paste_keypoints": []
+            }
+
+        objs_to_paste = np.random.choice(range(0, n_objects), size=n_select, replace=True)
+
+        selected_masks = [masks[idx] for idx in objs_to_paste]
+        selected_bboxes = [bboxes[idx] for idx in objs_to_paste] if bboxes else None
+
+        paste_imgs = []
+        alphas = []
+        paste_bboxes = []
+        paste_masks = []
+        nexted = 0
+
+        for i, (mask, bbox) in enumerate(zip(selected_masks, selected_bboxes)):
+            # Apply scale jittering
+            scaled_img, scaled_mask, scaled_bbox, scale_factor = apply_scale_jittering(paste_image, mask, bbox, self.scale_range)
+
+            # Create an empty black image
+            black_img = np.zeros_like(params["image"])
+            black_mask = np.zeros((h, w), dtype=np.uint8)
+
+            # Get the scaled dimensions
+            sw, sh = scaled_mask.shape[:2]
+
+            # Random position
+            bbox_h = scaled_bbox[3] - scaled_bbox[1]
+            bbox_w = scaled_bbox[2] - scaled_bbox[0]
+
+
+            # Random position within bbox dimensions
+            if not (h - bbox_h > 0 and w - bbox_w > 0):
+                #scale_factor too big
+                nexted+=1
+                continue
+            assert scaled_mask.any(), "empty mask"
+
+            start_y = np.random.randint(0, h - bbox_h + 1)
+            start_x = np.random.randint(0, w - bbox_w + 1)
+
+            end_y = start_y + bbox_h
+            end_x = start_x + bbox_w
+
+            assert end_y <= h and end_x <= w, f"top or left too big, {end_y}, {end_x}, should be <= {h}, {w}"
+            assert scaled_bbox[2] <= sh and scaled_bbox[3] <= sw, f"scaled box too big,  {scaled_bbox[2]}, {scaled_bbox[3]}, should be <= {sh}, {sw}"
+
+            # Place the scaled image and mask at the random position
+            black_img[start_y:end_y, start_x:end_x] = scaled_img[scaled_bbox[1]:scaled_bbox[3], scaled_bbox[0]:scaled_bbox[2]]
+            black_mask[start_y:end_y, start_x:end_x] = scaled_mask[scaled_bbox[1]:scaled_bbox[3], scaled_bbox[0]:scaled_bbox[2]]
+
+            paste_masks.append([black_mask])
+            paste_imgs.append(black_img)
+            alphas.append(black_mask)
+
+            paste_bboxes.append([(
+                start_y, 
+                start_x, 
+                end_y, 
+                end_x,
+                scaled_bbox[4],
+                i + nb_masks - nexted
+            )])
+        
+        ret = {
+            "param_masks": params["masks"],
+            "paste_imgs": paste_imgs,
+            "alphas": alphas,
+            "paste_masks": paste_masks,
+            "paste_bboxes": paste_bboxes,
+            "paste_keypoints": keypoints
+        }
+
+        return ret
+
+    @property
+    def ignore_kwargs(self):
+        return [
+            "paste_image",
+            "paste_mask",
+            "paste_masks"
+        ]
+
+    def apply_with_params(self, params, force_apply=False, **kwargs):  # skipcq: PYL-W0613
+        if params is None:
+            return kwargs
+        params = self.update_params(params, **kwargs)
+        res = {}
+        for key, arg in kwargs.items():
+            if arg is not None and key not in self.ignore_kwargs:
+                target_function = self._get_target_function(key)
+                target_dependencies = {k: kwargs[k] for k in self.target_dependence.get(key, [])}
+                target_dependencies['key'] = key
+                res[key] = target_function(arg, **dict(params, **target_dependencies))
+            else:
+                res[key] = None
+        return res
+
+    def apply(self, img, paste_imgs, alphas, **params):
+        for paste_img, alpha in zip(paste_imgs, alphas):
+            img = image_copy_paste(img, paste_img, alpha, blend=self.blend, sigma=self.sigma)
+        return img
+
+    def apply_to_masks(self, masks, paste_masks, alphas, **params):
+        for paste_mask, alpha in zip(paste_masks, alphas):
+            masks = masks_copy_paste(masks, paste_mask, alpha)
+        return masks
+
+    def apply_to_bboxes(self, bboxes, paste_bboxes, param_masks, paste_masks, alphas, key, **params):
+        original_boxes = copy.copy(bboxes)
+        original_boxes_processed = None
+        for paste_bbox, paste_mask, alpha in zip(paste_bboxes, paste_masks, alphas):
+            new_bboxes = bboxes_copy_paste(original_boxes, paste_bbox, param_masks, paste_mask, alpha, key)
+            if original_boxes_processed is None:
+                original_boxes_processed = new_bboxes[:len(original_boxes)]
+                bboxes = new_bboxes[:len(original_boxes)]
+            bboxes.extend(new_bboxes[len(original_boxes):])
+        return bboxes
+
+    def apply_to_mask(self, mask, paste_mask, alpha, **params):
+        return mask_copy_paste(mask, paste_mask, alpha)
+
+    def apply_to_keypoints(self, keypoints, paste_keypoints, alpha, **params):
+        raise NotImplementedError
+        #return keypoints_copy_paste(keypoints, paste_keypoints, alpha)
+
+    def get_transform_init_args_names(self):
+        return (
+            "blend",
+            "sigma",
+            "pct_objects_paste",
+            "max_paste_objects"
+        )
+
+def copy_paste_class(dataset_class):
+    def _split_transforms(self):
+        split_index = None
+        for ix, tf in enumerate(list(self.transforms.transforms)):
+            if tf.get_class_fullname() == 'copypaste.CopyPaste':
+                split_index = ix
+
+        if split_index is not None:
+            tfs = list(self.transforms.transforms)
+            pre_copy = tfs[:split_index]
+            copy_paste = tfs[split_index]
+            post_copy = tfs[split_index+1:]
+
+            #replicate the other augmentation parameters
+            bbox_params = None
+            keypoint_params = None
+            paste_additional_targets = {}
+            if 'bboxes' in self.transforms.processors:
+                bbox_params = self.transforms.processors['bboxes'].params
+                paste_additional_targets['paste_bboxes'] = 'bboxes'
+                if self.transforms.processors['bboxes'].params.label_fields:
+                    msg = "Copy-paste does not support bbox label_fields! "
+                    msg += "Expected bbox format is (a, b, c, d, label_field)"
+                    raise Exception(msg)
+            if 'keypoints' in self.transforms.processors:
+                keypoint_params = self.transforms.processors['keypoints'].params
+                paste_additional_targets['paste_keypoints'] = 'keypoints'
+                if keypoint_params.label_fields:
+                    raise Exception('Copy-paste does not support keypoint label fields!')
+
+            if self.transforms.additional_targets:
+                raise Exception('Copy-paste does not support additional_targets!')
+
+            #recreate transforms
+            self.transforms = A.Compose(pre_copy, bbox_params, keypoint_params, additional_targets=None)
+            self.post_transforms = A.Compose(post_copy, bbox_params, keypoint_params, additional_targets=None)
+            self.copy_paste = A.Compose(
+                [copy_paste], bbox_params, keypoint_params, additional_targets=paste_additional_targets
+            )
+        else:
+            self.copy_paste = None
+            self.post_transforms = None
+
+    def __getitem__(self, idx):
+        #split transforms if it hasn't been done already
+        if not hasattr(self, 'post_transforms'):
+            self._split_transforms()
+
+        img_data = self.load_example(idx)
+        if self.copy_paste is not None:
+            paste_idx = random.randint(0, self.__len__() - 1)
+            paste_img_data = self.load_example(paste_idx)
+            for k in list(paste_img_data.keys()):
+                paste_img_data['paste_' + k] = paste_img_data[k]
+                del paste_img_data[k]
+
+            img_data = self.copy_paste(**img_data, **paste_img_data)
+            img_data = self.post_transforms(**img_data)
+            img_data['paste_index'] = paste_idx
+
+        return img_data
+
+    setattr(dataset_class, '_split_transforms', _split_transforms)
+    setattr(dataset_class, '__getitem__', __getitem__)
+
+    return dataset_class
+    
 class CropAndPad(DualTransform):
     """Crop and pad images by pixel amounts or fractions of image sizes.
     Cropping removes pixels at the sides (i.e. extracts a subimage from a given full image).
