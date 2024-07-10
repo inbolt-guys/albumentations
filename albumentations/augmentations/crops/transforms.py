@@ -1,11 +1,17 @@
 import math
 import random
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+import copy
+from warnings import warn
+from math import ceil
 
 import cv2
 import numpy as np
+from skimage.filters import gaussian
 
 from albumentations.core.bbox_utils import union_of_bboxes
+from albumentations.core.composition import Compose
+
 
 from ...core.transforms_interface import (
     BoxInternalType,
@@ -562,17 +568,6 @@ class RandomSizedBBoxSafeCrop(BBoxSafeRandomCrop):
     def get_transform_init_args_names(self):
         return super().get_transform_init_args_names() + ("height", "width", "interpolation")
 
-import os
-import cv2
-import random
-import numpy as np
-import albumentations as A
-from copy import deepcopy
-from skimage.filters import gaussian
-from math import ceil, floor
-import copy
-from warnings import warn
-
 def image_copy_paste(img, paste_img, alpha, blend=True, sigma=1):
     if alpha is not None:
         if blend:
@@ -670,7 +665,7 @@ def apply_scale_jittering(image, mask, bbox, scale_range=(0.5, 1.5)):
     scaled_bbox = (round(scaled_bbox[0]*sw), round(scaled_bbox[1]*sh), round(scaled_bbox[2]*sw), round(scaled_bbox[3]*sh), bbox[4], bbox[5])
     return scaled_image, scaled_mask, scaled_bbox, scale_factor
 
-class CopyPaste(A.DualTransform):
+class CopyPaste(DualTransform):
     def __init__(
         self,
         blend=True,
@@ -727,7 +722,7 @@ class CopyPaste(A.DualTransform):
                         self.get_class_fullname() + " could work incorrectly in ReplayMode for other input data"
                         " because its' params depend on targets."
                     )
-                kwargs[self.save_key][id(self)] = deepcopy(params)
+                kwargs[self.save_key][id(self)] = copy.deepcopy(params)
             return self.apply_with_params(params, **kwargs)
 
         return kwargs
@@ -923,9 +918,9 @@ def copy_paste_class(dataset_class):
                 raise Exception('Copy-paste does not support additional_targets!')
 
             #recreate transforms
-            self.transforms = A.Compose(pre_copy, bbox_params, keypoint_params, additional_targets=None)
-            self.post_transforms = A.Compose(post_copy, bbox_params, keypoint_params, additional_targets=None)
-            self.copy_paste = A.Compose(
+            self.transforms = Compose(pre_copy, bbox_params, keypoint_params, additional_targets=None)
+            self.post_transforms = Compose(post_copy, bbox_params, keypoint_params, additional_targets=None)
+            self.copy_paste = Compose(
                 [copy_paste], bbox_params, keypoint_params, additional_targets=paste_additional_targets
             )
         else:
